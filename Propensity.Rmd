@@ -1,0 +1,470 @@
+---
+layout: default
+title: "Propensity Score Example"
+author: Laha Ale, Robert Gentleman
+date: "Updated on : `r date()`"
+# output: html_document
+vignette: >
+  %\VignetteIndexEntry{Propensity Scores}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+## 1. Goal
+
+The goal of this vignette is to demonstrate the use of propensity score matching using NHANES as an example.
+We want to look at smoking as the exposure of interest.
+We will look at individuals over 40 as our cohort of interest
+We will, at least for V1, ignore the survey weights - although they are important and can be incorporated.
+
+Useful information on propensity score matching can be found in this book chapter by Andrew Gelman and Jennifer Hill (chapter 10), https://sites.stat.columbia.edu/gelman/arm/
+
+
+We will use data from 2015-2016 and 2017-2018 which cover two NHANES cycles, the data tables we want will have the suffixes `_I` and `_J`. 
+
+You will want to use the NHANES in Docker project, here https://github.com/deepayan/nhanes-postgres
+
+And the phonto package which is here: https://github.com/ainilaha/phonto
+and can be installed using the standard R tools for installing packages from
+github (if needed, there is a version in the Docker container, but it might not be the most up to date).
+
+## 1. Load libs
+
+```{r setup,warning=FALSE,message=FALSE}
+library(splines)
+library(ggplot2)
+library(ggpubr)
+library(dplyr)
+library(nhanesA)
+library(phonto)
+library(knitr)
+library("MatchIt")
+```
+
+
+## 2. Data and Preprocessiing
+
+#### 2.1) Loading the Demographic, Body Measures, and Cholesterol data into R
+
+
+The authors state: 
+Participants with cobalt and lipid data were included (n = 6866). Demographic characteristics of the participants, including age, gender, body mass index (BMI), education level, race, family poverty-income ratio and smoking status, were collected. Clinical data, such as blood pressure, total cholesterol (TC), low-density lipoprotein cholesterol (LDL-C), HDL-C, triglycerides (TGs), hypertension, diabetes and history of medication use, including antihypertensive drugs, hypoglycemic drugs, and lipid-lowering drugs, were extracted.
+
+
+```{r readcancer data}
+cancerTab=nhanes("MCQ_J")
+#MCQ160O  #COPD
+#MCQ160B  #Ever told had congestive heart failure
+#MCQ203   #Ever been told you have jaundice?
+#MCQ220   #Ever told you had cancer or malignancy
+
+##consider getting DIQ_J: Diabetes status. and 
+##PAQ_J: Physical activity.
+## DR1/DR2_J: Dietary intake (sodium, potassium).
+```
+
+
+```{r demo_body,warning=FALSE,message=FALSE}
+
+##get the appropriate table names for the variables we will need
+##BP
+BPTabs = nhanesSearchVarName("BPQ050A", ystart="2015", ystop="2018")
+LDLTabs = nhanesSearchVarName('LBDLDL',ystart="2015", ystop="2018")
+##BPQ050A - currently taking meds for hypertension
+##BPQ080 - told by Dr. you have high cholesterol
+##BPQ100D - now taking meds for high cholesterol
+##A1C
+A1C = nhanesSearchVarName("LBXGH",ystart="2015", ystop="2018")
+##been told by Dr. has diabetes
+DrDiab = nhanesSearchVarName("DIQ010",ystart="2015", ystop="2018")
+##DIQ050 - taking insulin now
+##DIQ070 - taking pills for blood sugar
+
+##HDLTabs
+HDLTabs = nhanesSearchVarName("LBDHDD",ystart="2015", ystop="2018")
+BMITabs = nhanesSearchVarName("BMXBMI", ystart="2015", ystop="2018")
+BMXTabs = nhanesSearchVarName("BMXBMI",ystart="2015", ystop="2018")
+DIQTabs = nhanesSearchVarName("DIQ010",ystart="2015", ystop="2018")
+COBTabs = nhanesSearchVarName("LBXBCO",ystart="2015", ystop="2018" )
+TotChol = nhanesSearchVarName("LBXTC",ystart="2015", ystop="2018" )
+
+##set up the description of the tables, and variables within those tables we
+## will use.  Then use the jointQuery function to merge the tables and to merge
+##across cycles
+
+cols = list(DEMO_I=c("RIDAGEYR","RIAGENDR","RIDRETH1","DMDEDUC2", "INDFMPIR"), 
+            DEMO_J=c("RIDAGEYR","RIAGENDR","RIDRETH1","DMDEDUC2", "INDFMPIR"),
+            BPQ_I=c('BPQ050A','BPQ020','BPQ080','BPQ100D'),
+            BPQ_J=c('BPQ050A','BPQ020','BPQ080','BPQ100D'), 
+            HDL_I=c("LBDHDD"),HDL_J=c("LBDHDD"),
+            GHB_I="LBXGH",GHB_J="LBXGH",
+            DIQ_I=c("DIQ010","DIQ050","DIQ070","DIQ160"),
+            DIQ_J=c("DIQ010","DIQ050","DIQ070","DIQ160"), 
+            BMX_I="BMXBMI", BMX_J="BMXBMI",
+            TCHOL_I="LBXTC", TCHOL_J="LBXTC",
+            SMQ_I=c("SMQ020","SMD030","SMQ040","SMQ050Q", "SMQ050U", "SMD057","SMD650"),             SMQ_J=c("SMQ020","SMD030","SMQ040","SMQ050Q", "SMQ050U", "SMD057","SMD650"),
+            BPX_I=c("BPXDI1","BPXDI2","BPXSY1","BPXSY2"), 
+            BPX_J=c("BPXDI1","BPXDI2","BPXSY1","BPXSY2"),
+            TRIGLY_I=c("LBXTR","LBDLDL"), TRIGLY_J=c("LBXTR","LBDLDL"), 
+            MCQ_I = c("MCQ160O","MCQ160B", "MCQ203", "MCQ220"),
+            MCQ_J = c("MCQ160O","MCQ160B", "MCQ203", "MCQ220")
+            )
+var2Table = cols[c(1,3,5,7,9,11,13,15,17,19,21,23)]
+base_df <- jointQuery(cols)
+
+
+## the authors report only using individuals aged 40 and above, so we will subset to that group
+
+base_df = base_df[base_df$RIDAGEYR>=40,]
+dim(base_df)
+
+##now we need to fix things up for a small number of individuals where their smoking 
+## data seem incongrous
+badsmIds = c("85753", "98227", "98489", "100515", "95209", "89327", "97353", "97847")
+
+base_df = base_df[!(base_df$SEQN %in% badsmIds),]
+
+##how many of the individuals in our cohort have complete data for all variables?
+table(complete.cases(base_df))
+```
+
+
+#### Modify the NHANES phenotypes
+
+Now we look at some of the different variables that are going to be used in the analysis.
+The authors combined the reported ethnicities of Mexican American and Other Hispanic into one group. So we will duplicate that.  They also combined the education levels into three groups, those who had no high school record, some high school, through to completion, or some education beyond high school. In the code below we carry out similar transformations of the data.
+
+
+
+
+```{r}
+
+##Education levels
+base_df$DMDEDUC2 = factor(base_df$DMDEDUC2)
+
+levels(base_df$DMDEDUC2) <- c("HS",">HS",NA,"HS","<HS",NA,">HS")
+table(base_df$DMDEDUC2)
+
+##Ethnicity
+
+base_df$RIDRETH1 = factor(base_df$RIDRETH1)
+levels(base_df$RIDRETH1) = c("Hispanic/Mexican", "Non-Hispanic Black", "Non-Hispanic White",
+                          "Hispanic/Mexican", "Other")
+
+table(base_df$RIDRETH1)
+```
+We will define non-smoker as someone who as never smoked more than 100 cigarettes (`SMQ020`), anyone who has smoked more will be either
+a current smoker or an ex-smoker (`SMQ040`).
+But we also want some amount of exposure.  For current smokers we can use
+
+
+Now, for smoking things are a bit challenging because people with cancer diagnoses probably quit once they got their diagnosis.  So we want to try to see how to adjust a historical diagnosis of cancer with some sort of exposure.  
+```{r smoking}
+##Fixup the smoking variable there are some
+##challenges with this so read the documentation in SMQ_J and SMQ_I carefully
+
+##Refused and Don't know into NA
+table(base_df$SMQ020, useNA="always")
+base_df$SMQ020 = ifelse(base_df$SMQ020 %in% c("Don't know", "Refused"), NA, base_df$SMQ020)
+##for SMQ040 too
+table(base_df$SMQ040, useNA="always")
+smokingVar = ifelse(base_df$SMQ020=="No", "Non-smoker", 
+                    ifelse(base_df$SMQ040=="Not at all", "Ex-smoker",
+                    "Smoker"))
+table(smokingVar, useNA="always")
+
+##SMQ050Q is time since quit - but in three different units 
+##they used 66666 to represent 50 - not at all sure why
+##order of operations matters here
+base_df$SMQ050U[base_df$SMQ050Q == 66666] = "Years"
+base_df$SMQ050Q[base_df$SMQ050Q == 66666] = 50
+
+# time since quitting in years - 
+tsq = ifelse(base_df$SMQ050U == "Months", base_df$SMQ050Q/12,
+             ifelse(base_df$SMQ050U == "Days", base_df$SMQ050Q/365,
+                    ifelse(base_df$SMQ050U == "Years", base_df$SMQ050Q, 0)))
+
+##set the NAs to zero, this is mainly the non-smokers but it may also
+##affect those that refused for other reasons
+#tsq[is.na(base_df$SMQ050Q)] = 0
+
+## years smoking is then their current age - tsq - agetheystarted SMQ030
+## check for missing values
+sum(base_df$SMD030 > 100, na.rm=T)
+ageStartSm = ifelse(base_df$SMQ020 == "No", base_df$RIDAGEYR, base_df$SMD030)
+
+sum(is.na(ageStartSm))
+
+ageStopped = base_df$RIDAGEYR - tsq 
+
+yearsSmoked = ageStopped - ageStartSm
+##set these to zero for now
+yearsSmoked[is.na(yearsSmoked)] =0
+
+##note this oddity - maybe I have not processed the data
+##correctly - or there is some issue with the units for time
+## since smoking - eg if the resp. gave something in days or months
+## but it was written as years?
+which((base_df$RIDAGEYR- yearsSmoked)<10)
+
+plot(base_df$RIDAGEYR, yearsSmoked, col=ifelse(base_df$SMQ020=="Yes", "coral1", "seagreen"))
+
+sum(is.na(base_df$SMD057))
+hist(base_df$SMD057/20)
+
+hist(base_df$SMD650/20)
+
+##to get pack years we need to get packs/year and
+##then multiply by years - both SMD057 and SMD650 are
+##in # of cigs so need to divide by 20
+## numbers are much larger for SMD057 - which may 
+## reflect some memory issues, but also those might
+##have been the heavier smokers
+##NCI says:It is calculated by multiplying the number of packs of cigarettes smoked per day by the number of years the person has smoked. 
+
+pksSmoked = ifelse(!is.na(base_df$SMD057), base_df$SMD057/20,
+                   ifelse(!is.na(base_df$SMD650), base_df$SMD650/20, 0))
+
+base_df$yearsSmoked = yearsSmoked
+base_df$packYears = yearsSmoked * pksSmoked
+base_df$smokingVar = smokingVar
+
+##Poverty level - grouped as <1,  could be more granular
+## others use <1, 1-4.99 and >=5, but we want binary
+  PL = cut(base_df$INDFMPIR, breaks=c(-1,1,6), right=FALSE)
+  levels(PL) = c("<=1.0", ">1")
+  base_df$PL = PL
+  
+```
+
+
+
+## Looking at the other features in the data set
+
+For some variables NHANES reports multiple different variants of non-response
+such as "Don't know", or "Refused".  We will convert all of these to missing values, since for our purposes that seems reasonable.  We also address one of the issues around the design of the survey. In order to minimize irrelevant questions the survey taker will skip over some questions if they are not relevant.  There are many such instances in the NHANES surveys, and users will need to examine the variables they use carefully. From the Blood Pressure & Cholesterol survey the question `BPQ080` asks if the respondents doctor has ever told them that they have high blood pressure.  Respondents that answer yes, are then asked question `BPQ060`: Have you ever had your cholesterol checked, but those that answered no will not be asked that, and instead their response to `BPQ060` is a missing value. We feel, that for our purposes it would be better to *guess* that they would have said no to `BPQ060` and so we fill in a response of `no`.  If we don't do that, then in lots of other analyses we would lose those individuals as most modeling methods drop any cases with missing values.
+
+FIXME: Deepayan - not sure how we are automating this.
+
+```{r cholmeds-fixup}
+cholMeds = base_df$BPQ100D
+table(cholMeds, useNA="always")
+
+cholMeds[base_df$BPQ080=="No"] = "No"
+cholMeds[cholMeds=="Don't know"] = NA
+cholMeds = factor(cholMeds)
+table(cholMeds,useNA="always")
+base_df$cholMeds=cholMeds
+
+##now fixup the oral meds for diabetes
+##not counting insulin right now...might need it
+dontskip = base_df$DIQ010 == "Yes" | base_df$DIQ010 == "Borderline" | base_df$DIQ160 == "Yes"
+hypoglycemicMeds = base_df$DIQ070
+hypoglycemicMeds[!dontskip] = "No" 
+hypoglycemicMeds = factor(hypoglycemicMeds,levels=c("Yes", "No", "Don't know","Refused"), labels=c("Yes", "No",NA,NA))
+table(hypoglycemicMeds,useNA="always")
+base_df$hypoglycemicMeds = hypoglycemicMeds
+```
+
+In the next code chunk we load the glucose data.
+
+```{r Glucose, warning=FALSE, message=FALSE}
+##fasting glucose
+Fastgluc = nhanesSearchVarName("LBXGLU", ystart="2015", ystop="2018")
+glucTab = unionQuery(list(GLU_I="LBXGLU", GLU_J="LBXGLU"))
+base_df = merge(base_df, glucTab, all.x=TRUE)
+```
+
+#### Blood Pressure Data
+
+Both systolic (BPXS) and diastolic (BPXD) measurements were taken twice, on two separate occassions.  The authors of the Cobalt paper do not specify how they dealt this, did they use the first, the second, an average of the two?  How did they deal with individuals that did not show up for their second measurement?  We will use the average of these two measurements for individuals with two measurements, and in the case where only one measurement is available we will use it. The authors of the Cobalt paper don't specify which values they used, so this is one of the places where our analysis may differ from theirs.
+
+```{r extract_data, warning=FALSE, message=FALSE}
+##fixup the blood pressure data - using averages
+# Average the the first and second reads
+# taking some care to keep one measurement if the other is missing
+base_df$DIASTOLIC <- rowMeans(base_df[, c("BPXDI1", "BPXDI2")], na.rm=TRUE)
+base_df$DIASTOLIC[is.na(base_df$BPXDI1) & is.na(base_df$BPXDI2)] = NA
+base_df$SYSTOLIC <- rowMeans(base_df[, c("BPXSY1", "BPXSY2")], na.rm=TRUE)
+base_df$SYSTOLIC[is.na(base_df$BPXSY1) & is.na(base_df$BPXSY2)] = NA
+
+```
+  In our analysis we can then look at the average of the measurements across the two different time points as a way to estimate the actual blood pressure for each participant.
+
+In the code below we want to adjust the reported answers for the question about the use of hypertensive medicines.  Because of the way the survey was carried out, individuals who responded "No" when asked if they had ever been told they had high blood pressure were never asked if they were taking medication for high blood pressure.  It seems reasonable to assume that they would have said "No" had they been asked and so we make that adjustment. Otherwise such individuals will have a missing value for that variable and will be removed during many of the modeling steps we report on below.  Different users might choose to address this in different ways. We want to maximize the number of cases and feel that this is a reasonable choice.
+
+
+```{r}
+##
+## fixup the data for a skipped question
+hypertensiveMeds = base_df$BPQ050A
+hypertensiveMeds[base_df$BPQ020=="No"] = "No"
+hypertensiveMeds[base_df$BPQ040A=="No"] = "No"
+
+base_df$BPQ050A = hypertensiveMeds
+
+```
+At this point we have `r nrow(data)` individuals left. 
+
+
+
+## 2.4 Definitions
+
+https://wwwn.cdc.gov/nchs/nhanes/2011-2012/BPQ_G.htm
+
+```{r RiskFactors,warning=FALSE,message=FALSE}
+# "Hypertension was defined as systolic blood pressure (SBP) ≥140 mm Hg, diastolic blood pressure ≥90mm Hg, or the use of antihypertensive medication. "
+base_df$hypertension <- base_df$DIASTOLIC >= 90 | base_df$SYSTOLIC >= 140 |  base_df$BPQ050A=="Yes"
+table(base_df$hypertension)
+#barplot(table(base_df$hypertension))
+```
+```{r Diabetes, warning=FALSE, message=FALSE}
+base_df$diabetes = base_df$DIQ010 == "Yes" | base_df$LBXGLU > 110 | base_df$LBXGH > 6.5
+#barplot(table(base_df$diabetes))
+
+base_df$HighLDL = base_df$LBDLDL > 130
+#barplot(table(base_df$HighLDL))
+ 
+base_df$LowHDL = (base_df$RIAGENDR=="Male" & base_df$LBDHDD < 40) |    (base_df$RIAGENDR=="Female" & base_df$LBDHDD < 50) 
+#barplot(table(base_df$LowHDL))
+
+```
+Now lets define the elevated total cholesterol variable.
+
+```{r Dyslipidemia}
+elevatedTC = base_df$LBXTC>200
+base_df$elevatedTC = elevatedTC
+```
+
+
+
+
+## 3. Propensity Models
+
+Here we will start to think of what the model should look like.
+We want to perform a logistic regression on some known risk factors, where the outcome is our exposure of interest.  So we will look at smoking (or some variant).
+
+We will study its risk for cancer outomes so we want to make sure we adjust for a number of cancer risk factors.
+
+What will we look for:
+Age: cancer risk increases with age, in a non-linear way (splines).
+Sex: 
+Race/Ethnicity: 
+Socioeconomic Status: 
+Obesity (BMI, Waist Circumference): 
+
+We need a little more fixing up variables to get all missing values in place.
+
+
+```{r fixupvars}
+##we might want to just get to complete cases at some point
+base_df$MCQ220 = ifelse(base_df$MCQ220 == "Don't know", NA, base_df$MCQ220)
+
+##notice that current smokers seem to have a cancer rate similar to non-smokers
+## ex-smokers are much more likely to have been told they have cancer
+t1 = table(base_df$smokingVar, base_df$MCQ220)
+prop.table(t1, margin = 1)
+
+```
+
+Now a couple of plots to reveal a little of what is going on. So pack years seems to be much higher for ex-smokers than for current smokers.  This could be true (or maybe an error in the analysis above).  Recall that for NHANES we are really getting historical data on disease, which for cancer means that the respondent survived and/or was well enough to participate in the study.  That would be different than studying existing cancer cases. And it seems plausible that anyone with a cancer diagnosis would stop smoking - and become an ex-smoker. And it also seems plausible that heavy smokers would be more likely to get cancer - and hence to become ex-smokers....
+
+In any event it seems that the smoking variable does not work that well for predicting self-reported cancer and so we probably want to use pack years as our exposure in the propensity score modeling below.
+
+```{r plots}
+par(mfrow=c(1,2))
+boxplot(sqrt(base_df$packYears) ~ base_df$smokingVar, xlab="Smoker", 
+        ylab="sqrt(Pack Years)")
+
+boxplot(sqrt(base_df$packYears) ~ base_df$MCQ220, xlab="Ever told you have Cancer",
+        ylab="sqrt(Pack Years)")
+
+```
+
+
+```{r a few more tests}
+chisq.test(table(base_df$smokingVar, base_df$MCQ220))
+
+base_df$anySmoke = ifelse(base_df$smokingVar == "Non-smoker", 0, 1)
+base_df$obese = ifelse(base_df$BMXBMI >= 30, TRUE, FALSE)
+```
+
+Now let's get complete cases and examine the fit of our logistic regression model.
+It seems like there are good reasons to include interactions in the propensity score matching algorithms.  
+I don't have a good sense of whether that is more true for discrete variables than it is for linear variables, but I think it might be.
+
+I would also probably want to do some sort of PheWAS type analysis to see if any of the other features are predictive of the response, given the model `glm1
+
+```{r modelfit}
+##let's get complete cases
+subdf = base_df[,c("anySmoke", "packYears", "RIDAGEYR", "RIAGENDR", "obese", "RIDRETH1", "PL", "MCQ220")]
+
+baseCC = subdf[complete.cases(subdf),]
+baseCC$cancer = ifelse(baseCC$MCQ220=="Yes", 1, 0)
+
+##first - check that packYears is predictive of a reported cancer
+##probably we want a spline for packYears, but since there are so
+##many zeros we need to hand set the knots
+glm0 = glm(cancer ~ ns(packYears, knots=c(1,11,30,50)), data = baseCC, family="binomial")
+glm0a = glm(cancer ~ sqrt(packYears),  data=baseCC, family="binomial" )
+glm0b = glm(cancer ~ packYears, data=baseCC, family="binomial" )
+summary(glm0)
+
+#next fit the model we are most interested in, on the entire dataset
+#so we can compare with the fit after doing propensity score matching
+# since packYears and age are going to be highly correlated, we won't include
+#an interaction in the model between the two
+glm1 = glm(cancer ~ ns(RIDAGEYR, df=7) + 
+             sqrt(packYears) * (obese + RIAGENDR + PL + RIDRETH1) +
+             RIAGENDR:PL + RIDRETH1:RIAGENDR:RIDRETH1 + obese:PL + obese:RIDRETH1
+         + obese:RIAGENDR ,  data=baseCC, family="binomial")
+
+summary(glm1)
+
+lm1 = lm(sqrt(packYears) ~ ns(RIDAGEYR, df=7) + obese + RIAGENDR+PL+RIDRETH1
+           +RIAGENDR:PL+ RIDRETH1:PL + RIAGENDR:RIDRETH1 + obese:PL + obese:RIDRETH1
+         + obese:RIAGENDR,  data=baseCC)
+
+summary(lm1)
+```
+
+
+Now examine the propensity matching.
+```{r propmodel}
+m1 = lm(sqrt(packYears) ~ ns(RIDAGEYR, df=7) + obese + RIAGENDR+PL+RIDRETH1
+           +RIAGENDR:PL+RIDRETH1:RIAGENDR:RIDRETH1 + obese:PL + obese:RIDRETH1
+         + obese:RIAGENDR,  data=baseCC)
+
+py0 = baseCC$packYears > 1
+
+m.out <- matchit( py0 ~ ns(RIDAGEYR, df=7) + obese + RIAGENDR+PL+RIDRETH1
+           +RIAGENDR:PL+ RIDRETH1:PL + RIAGENDR:RIDRETH1 + obese:PL + obese:RIDRETH1
+         + obese:RIAGENDR, data=baseCC, replace = FALSE, ratio=1)
+
+m.sum = summary(m.out)
+plot(m.sum, var.order = "unmatched")
+```
+
+FIXME: produce the per variable density and bar plots
+
+And now compute the different effects on our outcome of interest.
+
+```{r compests}
+md <- match_data(m.out)
+
+fit1 <- glm( cancer ~ ns(RIDAGEYR, df=7) + 
+             sqrt(packYears) + (obese + RIAGENDR + PL + RIDRETH1) +
+             RIAGENDR:PL + RIDRETH1:RIAGENDR:RIDRETH1 + obese:PL + obese:RIDRETH1
+         + obese:RIAGENDR,
+           data = md,
+           weights = weights, family="binomial")
+summary(fit1)
+```
+
+```
